@@ -255,6 +255,9 @@ class CppSimdVecOverrides(OpOverrides):
     def logical_or(a, b):
         return f"{a} || {b}"
 
+    @staticmethod
+    def index_expr(expr, dtype):
+        return ops.to_dtype(cexpr(V.kernel.rename_indexing(expr)), dtype)
 
 class SimdVecChecker:
     def __init__(self):
@@ -470,7 +473,7 @@ class CppOverridesProxy(OpOverrides):
             return getattr(self.cpp_overrides, __name)
 
 class CppKernel(Kernel):
-    overrides = CppOverridesProxy
+    overrides = CppOverrides
     sexpr = cexpr
     newvar_prefix = "auto "
     suffix = ";"
@@ -486,59 +489,10 @@ class CppKernel(Kernel):
         self.reduction_vars = {}
         self.num_threads = num_threads  # num_threads the kernel specialized for
 
-        self.simd_len = config.cpp.simdlen
-        self.simd_vec = False
-
-    # Suppose the most inner var is "i0". Only support the case as follows:
-    #     index = i0 + expr(x, y, z, ...)
-    # Make sure to increase i0 by 1
-    def is_single_step_var(self, var: sympy.Symbol, index: sympy.Expr):
-        expanded_index = sympy.expand(index)
-        _not_add = lambda s: not (s.is_Add)
-        non_add_exprs = expanded_index.find(_not_add)
-        for non_add_expr in non_add_exprs:
-            if non_add_expr.is_symbol or non_add_expr.is_number:
-                continue
-
-            # In case -i0
-            if sympy.simplify(non_add_expr / var) == -1:
-                continue
-
-            if non_add_expr.has(var):
-                return False
-        return True
-
-    def is_var_irrevelant(self, var: sympy.Symbol, index: sympy.Expr):
-        expanded_index = sympy.expand(index)
-        return not expanded_index.has(var)
-
-    def transform_index(self, index: sympy.Expr):
-        expanded_index = sympy.expand(index)
-        if self.simd_vec:
-            assert self.simd_len
-            assert self.simd_len > 0
-            most_inner_var = self.itervars[-1]
-            replacement = {most_inner_var : most_inner_var * self.simd_len}
-            new_index = sympy_subs(expanded_index, replacement)
-            return new_index
-        else:
-            return expanded_index
-
     def load(self, name: str, index: sympy.Expr):
         var = self.args.input(name)
         index = self.rename_indexing(index)
-
-        if self.simd_len and self.simd_vec and V.graph.get_dtype(name) is torch.float:
-            expanded_index = sympy.expand(index)
-            new_index = self.transform_index(index)
-
-            if expanded_index != new_index:
-                line = f"at::vec::Vectorized<float>::loadu({var} + {cexpr(new_index)})"
-            else:
-                line = f"at::vec::Vectorized<float>({var}[{cexpr(index)}])"
-        else:
-            line = f"{var}[{cexpr(index)}]"
-
+        line = f"{var}[{cexpr(index)}]"
         if V.graph.get_dtype(name) in (torch.float16, torch.bfloat16):
             line = f"static_cast<float>({line})"
         return self.cse.generate(self.loads, line)
@@ -548,13 +502,7 @@ class CppKernel(Kernel):
         var = self.args.output(name)
         index = self.rename_indexing(index)
         if mode is None:
-            if self.simd_len and self.simd_vec:
-                expanded_index = sympy.expand(index)
-                new_index = self.transform_index(index)
-                assert new_index != expanded_index
-                line = f"{value}.store({var} + {cexpr(new_index)});"
-            else:
-                line = f"{var}[{cexpr(index)}] = {value};"
+            line = f"{var}[{cexpr(index)}] = {value};"
         elif mode == "atomic_add":
             if not config.cpp.dynamic_threads and self.num_threads == 1:
                 line = f"{var}[{cexpr(index)}] += {value};"
@@ -623,27 +571,28 @@ class CppKernel(Kernel):
     def size_hint(self):
         return V.graph.sizevars.size_hint(sympy_product(self.call_ranges))
 
-    def codegen_loops(self, code, simd_vec_kernel, worksharing):
+    def codegen_loops(self, code, worksharing):
         threads = config.cpp.threads
         if threads < 1:
             threads = torch.get_num_threads()
 
         loops = [LoopLevel(var, size) for var, size in zip(self.itervars, self.ranges)]
-        loops_nest_non_reduc, reductions = LoopNest(
-            loops[: self.reduction_depth]
-        ), LoopNest(loops[self.reduction_depth :])
+        loops, reductions = LoopNest(loops[: self.reduction_depth]), LoopNest(
+            loops[self.reduction_depth :]
+        )
         reductions.mark_reduction(self.reduction_vars)
 
         if config.cpp.simdlen:
             # TODO(jansel): detect stride-1 dimension and vectorize that
-            if reductions:
-                reductions.loops[-1].simd_omp = True
+            if reductions and len(reductions.loops) > 0:
+                reductions.loops[-1].simd = True
             else:
-                loops_nest_non_reduc.loops[-1].simd_omp = True
+                if len(reductions.loops) > 0:
+                    loops.loops[-1].simd = True
 
         par_depth = 0
         reduction_par_depth = 0
-        if loops_nest_non_reduc:
+        if loops:
             par_depth = self.decide_parallel_depth(
                 self.call_ranges[: self.reduction_depth], threads
             )
@@ -655,7 +604,7 @@ class CppKernel(Kernel):
         with contextlib.ExitStack() as stack:
             if par_depth:
                 worksharing.parallel(threads)
-                loops_nest_non_reduc.mark_parallel(par_depth)
+                loops.mark_parallel(par_depth)
             elif reduction_par_depth:
                 # need to close the worksharing scope to define reduction vars outside it
                 worksharing.close()
@@ -664,33 +613,26 @@ class CppKernel(Kernel):
                 if worksharing.single():
                     stack.enter_context(code.indent())
 
-            simd_omp_kernel = self
-            loops_nest_non_reduc.vectorize_most_inner_loop(
-                simd_vec_kernel, simd_omp_kernel
-            )
-            loops_nest_non_reduc.codegen(code, stack)
+            loops.codegen(code, stack)
 
-            if isinstance(loops_nest_non_reduc.loops[-1], LoopLevelWithTail):
-                pass
-            else:
-                with contextlib.ExitStack() as stack_outer:
-                    if self.reduction_prefix:
-                        stack_outer.enter_context(code.indent())
-                    code.splice(self.reduction_prefix)
+            with contextlib.ExitStack() as stack_outer:
+                if self.reduction_prefix:
+                    stack_outer.enter_context(code.indent())
+                code.splice(self.reduction_prefix)
 
-                    if reduction_par_depth:
-                        worksharing.parallel(threads)
+                if reduction_par_depth:
+                    worksharing.parallel(threads)
 
-                    with contextlib.ExitStack() as stack:
-                        reductions.codegen(code, stack)
-                        code.splice(self.loads)
-                        code.splice(self.compute)
-                        code.splice(self.stores)
+                with contextlib.ExitStack() as stack:
+                    reductions.codegen(code, stack)
+                    code.splice(self.loads)
+                    code.splice(self.compute)
+                    code.splice(self.stores)
 
-                    if reduction_par_depth:
-                        worksharing.close()
+                if reduction_par_depth:
+                    worksharing.close()
 
-                    code.splice(self.reduction_suffix)
+                code.splice(self.reduction_suffix)
 
     def decide_parallel_depth(self, ranges, threads):
         seq = self.size_hint()
@@ -727,7 +669,73 @@ class CppKernel(Kernel):
         (self.loads, self.compute, self.stores, self.cse) = prior
 
 
-class CppSimdVecKernelChecker(CppKernel):
+class CppSimdVecKernel(CppKernel):
+    overrides = CppSimdVecOverrides
+
+    def __init__(self, args, num_threads):
+        super(CppSimdVecKernel, self).__init__(args, num_threads)
+        self.simd_len = config.cpp.simdlen
+
+    # Suppose the most inner var is "i0". Only support the case as follows:
+    #     index = i0 + expr(x, y, z, ...)
+    # Make sure to increase i0 by 1
+    def is_single_step_var(self, var: sympy.Symbol, index: sympy.Expr):
+        expanded_index = sympy.expand(index)
+        _not_add = lambda s: not (s.is_Add)
+        non_add_exprs = expanded_index.find(_not_add)
+        for non_add_expr in non_add_exprs:
+            if non_add_expr.is_symbol or non_add_expr.is_number:
+                continue
+
+            # In case -i0
+            if sympy.simplify(non_add_expr / var) == -1:
+                continue
+
+            if non_add_expr.has(var):
+                return False
+        return True
+
+    def is_var_irrevelant(self, var: sympy.Symbol, index: sympy.Expr):
+        expanded_index = sympy.expand(index)
+        return not expanded_index.has(var)
+
+    def transform_index(self, index: sympy.Expr):
+        expanded_index = sympy.expand(index)
+        assert self.simd_len
+        assert self.simd_len > 0
+        most_inner_var = self.itervars[-1]
+        replacement = {most_inner_var : most_inner_var * self.simd_len}
+        new_index = sympy_subs(expanded_index, replacement)
+        return new_index
+
+    def load(self, name: str, index: sympy.Expr):
+        var = self.args.input(name)
+        index = self.rename_indexing(index)
+
+        expanded_index = sympy.expand(index)
+        new_index = self.transform_index(index)
+
+        if expanded_index != new_index:
+            line = f"at::vec::Vectorized<float>::loadu({var} + {cexpr(new_index)})"
+        else:
+            line = f"at::vec::Vectorized<float>({var}[{cexpr(index)}])"
+
+        return self.cse.generate(self.loads, line)
+
+    def store(self, name, index, value, mode=None):
+        assert "buf" in name
+        var = self.args.output(name)
+        index = self.rename_indexing(index)
+        assert mode is None
+
+        expanded_index = sympy.expand(index)
+        new_index = self.transform_index(index)
+        assert new_index != expanded_index
+        line = f"{value}.store({var} + {cexpr(new_index)});"
+        self.stores.writeline(name, line)
+
+
+class CppSimdVecKernelChecker(CppSimdVecKernel):
     def __init__(self, args, num_threads):
         super(CppSimdVecKernelChecker, self).__init__(args, num_threads)
         self.simd_vec = True
@@ -737,29 +745,37 @@ class CppSimdVecKernelChecker(CppKernel):
                 self.fast_vec_list.append(dict_obj)
         self.exit_stack = contextlib.ExitStack()
 
-    def could_be_simd_vec(self, var: sympy.Symbol, index: sympy.Expr):
+    def is_legal_data_access(self, var: sympy.Symbol, index: sympy.Expr):
         return self.is_var_irrevelant(var, index) or self.is_single_step_var(var, index)
+
+    def could_be_simd_vec(self, name: str, index: sympy.Expr):
+        if V.graph.get_dtype(name) is not torch.float:
+            return False
+
+        assert self.itervars is not None
+        # Not a loop
+        if len(self.itervars) == 0:
+            return False
+
+        most_inner_var = self.itervars[-1]
+        return self.is_legal_data_access(most_inner_var, index)
 
     def load(self, name: str, index: sympy.Expr):
         index = self.rename_indexing(index)
 
-        if V.graph.get_dtype(name) is torch.float:
-            most_inner_var = self.itervars[-1]
-            self.simd_vec = self.simd_vec and self.could_be_simd_vec(most_inner_var, index)
-            return self.simd_vec
-        else:
-            return False
+        self.simd_vec = self.simd_vec and self.could_be_simd_vec(name, index)
+        return self.simd_vec
 
     def store(self, name, index, value, mode=None):
         assert "buf" in name
         index = self.rename_indexing(index)
 
-        if V.graph.get_dtype(name) is torch.float:
-            most_inner_var = self.itervars[-1]
-            self.simd_vec = self.simd_vec and self.could_be_simd_vec(most_inner_var, index)
-            return self.simd_vec
-        else:
+        if not mode:
+            self.simd_vec = False
             return False
+
+        self.simd_vec = self.simd_vec and self.could_be_simd_vec(name, index)
+        return self.simd_vec
 
     def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
         self.simd_vec = False
@@ -793,9 +809,103 @@ class CppSimdVecKernelChecker(CppKernel):
                     name, dtype, src_dtype, reduction_type, index, value
                 )
 
+            @staticmethod
+            def index_expr(expr, dtype):
+                return ops.to_dtype(cexpr(V.kernel.rename_indexing(expr)), dtype)
+
+            @staticmethod
+            def indirect_indexing(index_var):
+                return sympy.Symbol(str(index_var))
+
+            @staticmethod
+            def masked(mask, body, other):
+                return V.kernel.cse.newvar()
+
         self.exit_stack.enter_context(V.set_ops_handler(SimdVecCheckerProxy()))
         self.exit_stack.enter_context(V.set_kernel_handler(self))
         return self
+
+
+class CppKernelProxy(CppKernel):
+    def __init__(self, args=None, num_threads=None):
+        super().__init__(args, num_threads)
+        self.simd_vec_kernel = None
+        self.simd_omp_kernel = None
+
+    def vectorize_most_inner_loop(self, loop_nest):
+        loop_nest.split_most_inner_loop(config.cpp.simdlen)
+        loop_with_tail = loop_nest.loops[-1]
+        assert isinstance(loop_with_tail, LoopLevelWithTail)
+
+        self.simd_vec_kernel.simd = False
+        self.simd_vec_kernel.fast_vec = True
+
+        loop_with_tail.tail_loop.simd_omp = True
+        loop_with_tail.tail_loop.simd_len = int(config.cpp.simdlen / 2)
+        loop_with_tail.tail_loop.simd_vec = False
+
+        loop_with_tail.main_loop_body = self.simd_vec_kernel
+        loop_with_tail.tail_loop_body = self.simd_omp_kernel
+        return loop_nest
+
+    def codegen_loops(self, code, worksharing):
+        threads = config.cpp.threads
+        if threads < 1:
+            threads = torch.get_num_threads()
+
+        if self.simd_vec_kernel is None:
+            assert self.simd_omp_kernel
+            return self.simd_omp_kernel.codegen_loops(code, worksharing)
+
+        assert self.simd_vec_kernel.itervars == self.simd_omp_kernel.itervars
+        assert self.simd_vec_kernel.ranges == self.simd_omp_kernel.ranges
+
+        itervars = self.simd_vec_kernel.itervars
+        rangs = self.simd_vec_kernel.ranges
+        loops = [LoopLevel(var, size) for var, size in zip(itervars, rangs)]
+        loops_nest_non_reduc, reductions = LoopNest(
+            loops[: self.reduction_depth]
+        ), LoopNest(loops[self.reduction_depth :])
+
+        # TODO: Support reductions
+        # assert reductions is None or len(reductions.loops) == 0
+
+        assert config.cpp.simdlen
+        loops_nest_non_reduc.loops[-1].simd_omp = True
+
+        par_depth = 0
+        if loops_nest_non_reduc:
+            par_depth = self.simd_vec_kernel.decide_parallel_depth(
+                self.simd_vec_kernel.call_ranges[: self.reduction_depth],
+                threads
+            )
+
+        with contextlib.ExitStack() as stack:
+            if par_depth:
+                worksharing.parallel(threads)
+                loops_nest_non_reduc.mark_parallel(par_depth)
+            elif threads > 1:
+                if worksharing.single():
+                    stack.enter_context(code.indent())
+
+            self.vectorize_most_inner_loop(loops_nest_non_reduc)
+
+            for loop in loops_nest_non_reduc.loops[0:-1]:
+                code.writelines(loop.lines())
+                stack.enter_context(code.indent())
+
+            loop_with_tail: LoopLevelWithTail = loops_nest_non_reduc.loops[-1]
+            for loop, kernel in (
+                (loop_with_tail.main_loop, loop_with_tail.main_loop_body),
+                (loop_with_tail.tail_loop, loop_with_tail.tail_loop_body)
+                ):
+
+                code.writelines(loop.lines())
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(code.indent())
+                    code.splice(kernel.loads)
+                    code.splice(kernel.compute)
+                    code.splice(kernel.stores)
 
 class CppScheduling:
     def __init__(self, scheduler):
@@ -855,9 +965,8 @@ class CppScheduling:
         ).group
         in_suffix = False
 
-        with kernel_group.new_kernel() as kernel:
+        with kernel_group.new_kernel(is_simd_vec) as kernel:
             vars, reduction_vars = kernel.set_ranges(group, reduction_group)
-            kernel.simd_vec = is_simd_vec
 
             for node in nodes:
                 if node.group[1] in [
@@ -890,9 +999,13 @@ class CppScheduling:
             if can_be_simd_vec
             else None
         )
-        scalar_kernel = self._codegen_nodes_impl(nodes)
+        simd_omp_kernel = self._codegen_nodes_impl(nodes)
 
-        kernel_group.finalize_kernel(scalar_kernel, simd_vec_kernel, None)
+        cpp_kernel_proxy = CppKernelProxy(kernel_group.args, kernel_group.ws.num_threads)
+        cpp_kernel_proxy.simd_vec_kernel = simd_vec_kernel
+        cpp_kernel_proxy.simd_omp_kernel = simd_omp_kernel
+
+        kernel_group.finalize_kernel(cpp_kernel_proxy, None)
 
     def flush(self):
         self.kernel_group.codegen_define_and_call(V.graph.wrapper_code)
@@ -909,14 +1022,17 @@ class KernelGroup:
         self.stack.enter_context(self.ws)
         self.count = 0
 
-    def new_kernel(self):
-        return CppKernel(self.args, self.ws.num_threads)
+    def new_kernel(self, simd_vec = False):
+        if simd_vec:
+            return CppSimdVecKernel(self.args, self.ws.num_threads)
+        else:
+            return CppKernel(self.args, self.ws.num_threads)
 
-    def finalize_kernel(self, scalar_kernel, simd_vec_kernel, scheduler):
+    def finalize_kernel(self, new_kernel, scheduler):
         self.count += 1
         code = self.loops_code
         ws = self.ws
-        scalar_kernel.codegen_loops(code, simd_vec_kernel, ws)
+        new_kernel.codegen_loops(code, ws)
 
     def codegen_define_and_call(self, wrapper):
         self.stack.close()
