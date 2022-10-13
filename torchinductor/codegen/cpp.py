@@ -216,90 +216,12 @@ class CppSimdVecOverrides(OpOverrides):
         return f"{x}.lgamma()"
 
     @staticmethod
-    def relu(x):
-        dtype_str = DTYPE_TO_CPP[V.kernel.cse.get_dtype(x)]
-        quot = f"at::vec::Vectorized<{dtype_str}>(0)"
-        return f"at::vec::Vectorized<{dtype_str}>::clamp_min({x}, {quot})"
-
-    @staticmethod
-    def minimum(a, b):
-        dtype_str = DTYPE_TO_CPP[V.kernel.cse.get_dtype(a)]
-        assert dtype_str == DTYPE_TO_CPP[V.graph.get_dtype(b)]
-        return f"at::vec::Vectorized<{dtype_str}>::minimum({a}, {b})"
-
-    @staticmethod
-    def maximum(a, b):
-        dtype_str = DTYPE_TO_CPP[V.kernel.cse.get_dtype(a)]
-        assert dtype_str == DTYPE_TO_CPP[V.kernel.cse.get_dtype(b)]
-        return f"at::vec::Vectorized<{dtype_str}>::maximum({a}, {b})"
-
-    @staticmethod
-    def constant(val, dtype):
-        dtype_str = DTYPE_TO_CPP[dtype]
-        if val == float("inf"):
-            quot = f"std::numeric_limits<{dtype_str}>::infinity()"
-            return f"at::vec::Vectorized<{dtype_str}>({quot})"
-        elif val == float("-inf"):
-            quot = f"-std::numeric_limits<{dtype_str}>::infinity()"
-            return f"at::vec::Vectorized<{dtype_str}>({quot})"
-        elif val is True or val is False:
-            # TODO: It will trigger not-implemented error
-            return ops.to_dtype(str(val).lower(), dtype)
-        return ops.to_dtype(repr(val), dtype)
-
-    @staticmethod
     def logical_and(a, b):
         return f"{a} && {b}"
 
     @staticmethod
     def logical_or(a, b):
         return f"{a} || {b}"
-
-    @staticmethod
-    def index_expr(expr, dtype):
-        return ops.to_dtype(cexpr(V.kernel.rename_indexing(expr)), dtype)
-
-class SimdVecChecker:
-    def __init__(self):
-        super(SimdVecChecker, self).__init__()
-        self.simd_vec = True
-        self.fast_vec_list = ["load", "store"]
-        for dict_obj in CppSimdVecOverrides.__dict__:
-            if isinstance(CppSimdVecOverrides.__dict__[dict_obj], staticmethod):
-                self.fast_vec_list.append(dict_obj)
-
-        self.exit_stack = contextlib.ExitStack()
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.exit_stack.__exit__(exc_type, exc_val, exc_tb)
-
-    def __enter__(self):
-        class SimdVecCheckerProxy:
-            @staticmethod
-            def __getattr__(name):
-                def inner(*args, **kwargs):
-                    if not (name in self.fast_vec_list):
-                        self.simd_vec = False
-                    return self.simd_vec
-
-                return inner
-
-            @staticmethod
-            def load(name: str, index: sympy.Expr):
-                return self.load(name, index)
-
-            @staticmethod
-            def store(name, index, value, mode=None):
-                return self.store(name, index, value, mode=mode)
-
-            @staticmethod
-            def reduction(name, dtype, src_dtype, reduction_type, index, value):
-                return self.reduction(
-                    name, dtype, src_dtype, reduction_type, index, value
-                )
-
-        self.exit_stack.enter_context(V.set_ops_handler(SimdVecCheckerProxy()))
-        return self
 
 
 class CppOverrides(OpOverrides):
@@ -770,7 +692,7 @@ class CppSimdVecKernelChecker(CppSimdVecKernel):
         assert "buf" in name
         index = self.rename_indexing(index)
 
-        if not mode:
+        if mode:
             self.simd_vec = False
             return False
 
@@ -811,7 +733,7 @@ class CppSimdVecKernelChecker(CppSimdVecKernel):
 
             @staticmethod
             def index_expr(expr, dtype):
-                ops.to_dtype(cexpr(V.kernel.rename_indexing(expr)), dtype)
+                self.simd_vec = False
                 return self.cse.newvar()
 
             @staticmethod
