@@ -599,23 +599,9 @@ class CppSimdVecKernel(CppKernel):
         self.simd_len = config.cpp.simdlen
 
     # Suppose the most inner var is "i0". Only support the case as follows:
-    #     index = i0 + expr(x, y, z, ...)
-    # Make sure to increase i0 by 1
+    #     index = i0
     def is_single_step_var(self, var: sympy.Symbol, index: sympy.Expr):
-        expanded_index = sympy.expand(index)
-        _not_add = lambda s: not (s.is_Add)
-        non_add_exprs = expanded_index.find(_not_add)
-        for non_add_expr in non_add_exprs:
-            if non_add_expr.is_symbol or non_add_expr.is_number:
-                continue
-
-            # In case -i0
-            if sympy.simplify(non_add_expr / var) == -1:
-                continue
-
-            if non_add_expr.has(var):
-                return False
-        return True
+        return var == index
 
     def is_var_irrevelant(self, var: sympy.Symbol, index: sympy.Expr):
         expanded_index = sympy.expand(index)
