@@ -811,7 +811,8 @@ class CppSimdVecKernelChecker(CppSimdVecKernel):
 
             @staticmethod
             def index_expr(expr, dtype):
-                return ops.to_dtype(cexpr(V.kernel.rename_indexing(expr)), dtype)
+                ops.to_dtype(cexpr(V.kernel.rename_indexing(expr)), dtype)
+                return self.cse.newvar()
 
             @staticmethod
             def indirect_indexing(index_var):
