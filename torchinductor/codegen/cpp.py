@@ -9,6 +9,7 @@ import sympy
 import torch
 from torch._prims_common import is_float_dtype
 
+from .. import metrics
 from .. import codecache
 from .. import config
 from .. import ir
@@ -509,7 +510,7 @@ class CppKernel(Kernel):
             if reductions and len(reductions.loops) > 0:
                 reductions.loops[-1].simd = True
             else:
-                if len(reductions.loops) > 0:
+                if len(loops.loops) > 0:
                     loops.loops[-1].simd = True
 
         par_depth = 0
@@ -646,6 +647,7 @@ class CppSimdVecKernel(CppKernel):
 class CppSimdVecKernelChecker(CppSimdVecKernel):
     def __init__(self, args, num_threads):
         super(CppSimdVecKernelChecker, self).__init__(args, num_threads)
+        metrics.generated_kernel_count -= 1
         self.simd_vec = True
         self.fast_vec_list = []
         for dict_obj in CppSimdVecOverrides.__dict__:
@@ -909,6 +911,12 @@ class CppScheduling:
             else None
         )
         simd_omp_kernel = self._codegen_nodes_impl(nodes)
+
+        assert simd_omp_kernel
+        metrics.generated_kernel_count -= 1
+        # Maitain the metrics kernel count
+        if simd_vec_kernel:
+            metrics.generated_kernel_count -= 1
 
         cpp_kernel_proxy = CppKernelProxy(kernel_group.args, kernel_group.ws.num_threads)
         cpp_kernel_proxy.simd_vec_kernel = simd_vec_kernel
